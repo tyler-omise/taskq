@@ -352,7 +352,12 @@ func (q *Queue) scheduleDelayed(ctx context.Context) (int, error) {
 func (q *Queue) cleanZombieConsumers(ctx context.Context) (int, error) {
 	consumers, err := q.redis.XInfoConsumers(ctx, q.stream, q.streamGroup).Result()
 	if err != nil {
-		return 0, err
+		if shouldFallbackXInfoConsumers(err) {
+			consumers, err = q.xinfoConsumersFallback(ctx)
+		}
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	for _, consumer := range consumers {
@@ -464,4 +469,129 @@ func unmarshalMessage(msg *taskq.Message, xmsg *redis.XMessage) error {
 	}
 
 	return nil
+}
+
+// shouldFallbackXInfoConsumers detects go-redis v8 decode errors caused by
+// newer Redis/Valkey adding extra fields to XINFO CONSUMERS replies.
+func shouldFallbackXInfoConsumers(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "XINFO CONSUMERS reply") ||
+		strings.Contains(msg, "wanted 6") ||
+		strings.Contains(msg, "unexpected content")
+}
+
+func (q *Queue) xinfoConsumersFallback(ctx context.Context) ([]redis.XInfoConsumer, error) {
+	doer, ok := q.redis.(interface {
+		Do(ctx context.Context, args ...interface{}) *redis.Cmd
+	})
+	if !ok {
+		return nil, fmt.Errorf("redisq: redis client does not support Do for XINFO fallback")
+	}
+
+	cmd := doer.Do(ctx, "XINFO", "CONSUMERS", q.stream, q.streamGroup)
+	raw, err := cmd.Result()
+	if err != nil {
+		return nil, err
+	}
+
+	return parseRawXInfoConsumers(raw)
+}
+
+// parseRawXInfoConsumers walks the raw array reply and keeps only successfully
+// parsed consumer entries, ignoring malformed ones.
+func parseRawXInfoConsumers(val interface{}) ([]redis.XInfoConsumer, error) {
+	items, ok := val.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("redisq: unexpected XINFO CONSUMERS reply type %T", val)
+	}
+
+	consumers := make([]redis.XInfoConsumer, 0, len(items))
+	for _, raw := range items {
+		consumer, ok := parseRawXInfoConsumer(raw)
+		if ok {
+			consumers = append(consumers, consumer)
+		}
+	}
+	return consumers, nil
+}
+
+// parseRawXInfoConsumer tolerates 6-field (name/pending/idle) and 8-field
+// (including inactive) replies, preferring inactive as the timeout indicator.
+func parseRawXInfoConsumer(raw interface{}) (redis.XInfoConsumer, bool) {
+	data, ok := raw.([]interface{})
+	if !ok || len(data) < 6 || len(data)%2 != 0 {
+		return redis.XInfoConsumer{}, false
+	}
+
+	var c redis.XInfoConsumer
+	var hasName bool
+	var idleSet bool
+	var inactiveSet bool
+
+	for i := 0; i < len(data); i += 2 {
+		key, ok := data[i].(string)
+		if !ok {
+			continue
+		}
+		val := data[i+1]
+
+		switch key {
+		case "name":
+			if s, ok := val.(string); ok {
+				c.Name = s
+				hasName = true
+			}
+		case "pending":
+			if n, ok := toInt64(val); ok {
+				c.Pending = n
+			}
+		case "idle":
+			if n, ok := toInt64(val); ok && !inactiveSet {
+				c.Idle = n
+				idleSet = true
+			}
+		case "inactive":
+			if n, ok := toInt64(val); ok {
+				c.Idle = n
+				inactiveSet = true
+			}
+		}
+	}
+
+	if !hasName {
+		return redis.XInfoConsumer{}, false
+	}
+
+	// If neither idle nor inactive is present, fall back to zero.
+	if !idleSet && !inactiveSet {
+		c.Idle = 0
+	}
+
+	return c, true
+}
+
+// toInt64 best-effort converts Redis bulk/string/int representations to int64.
+func toInt64(v interface{}) (int64, bool) {
+	switch t := v.(type) {
+	case int64:
+		return t, true
+	case int:
+		return int64(t), true
+	case uint64:
+		return int64(t), true
+	case string:
+		n, err := strconv.ParseInt(t, 10, 64)
+		if err == nil {
+			return n, true
+		}
+	case []byte:
+		n, err := strconv.ParseInt(string(t), 10, 64)
+		if err == nil {
+			return n, true
+		}
+	}
+	return 0, false
 }
